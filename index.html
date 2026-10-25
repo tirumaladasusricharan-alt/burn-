@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Candle</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; cursor: pointer; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 14px; text-align: center;
+    font: 12px/1.4 Consolas, Menlo, "DejaVu Sans Mono", monospace;
+    color: #6b3a1c; letter-spacing: .5px; pointer-events: none;
+    transition: opacity 1.5s;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">click / R = restart &nbsp;·&nbsp; space = pause</div>
+<script>
+"use strict";
+// ASCII Candle - browser version of candle.py
+// A match is struck, it lights a candle, the flame grows, the candle tips
+// over and the whole floor goes up in flames.
+
+// ---------------------------------------------------------------- settings
+const COLS = 100, ROWS = 62;          // character grid
+const CW = 7, CH = 12;                // size of one cell in world pixels
+const W = COLS * CW, H = ROWS * CH;
+const RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+const N = RAMP.length - 1;
+const ALL = RAMP + "=";
+const CI = {}; for (let i = 0; i < ALL.length; i++) if (!(ALL[i] in CI)) CI[ALL[i]] = i;
+
+// timeline (seconds)
+const T_STRIKE = 1.2, T_LIGHT = 3.2, T_OUT = 3.9;
+const T_TIP = 8.6, T_FALL = 0.55, T_IGNITE = T_TIP + T_FALL;
+
+// geometry
+const FLOOR_Y = H * 0.80;
+const CAND_W = 13 * CW, CAND_H = 20 * CH, CAND_X = W * 0.40;
+const PX = CAND_X + CAND_W / 2, PY = FLOOR_Y;     // pivot: bottom-right corner
+
+// colours
+const WAX = [0.78, 0.58, 0.32], BURNT = [0.07, 0.05, 0.04];
+const EMBER = [0.62, 0.12, 0.05], ORANGE = [1.0, 0.55, 0.15];
+const WHITE = [1.0, 0.95, 0.78], BG_COL = [0.60, 0.25, 0.09];
+const FLOOR_COL = [0.80, 0.42, 0.18];
+const CITY_COL = [0.24, 0.29, 0.38], WINDOW_COL = [0.72, 0.39, 0.13];
+
+// ---------------------------------------------------------------- helpers
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const smoothstep = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+function hash(ix, iy) { const h = Math.sin(ix * 127.1 + iy * 311.7) * 43758.5453; return h - Math.floor(h); }
+function nz2(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+const nz = (x, seed = 0) => nz2(x, seed);
+const fbm = (x, y) => 0.5 * nz2(x, y) + 0.3 * nz2(x * 2.1 + 5.2, y * 2.1 + 1.3) + 0.2 * nz2(x * 4.3 + 9.1, y * 4.3 + 7.7);
+
+function rampIndex(lum, jit, spread) {
+  if (lum < 0.03) return 0;
+  const idx = Math.pow(clamp(lum), 0.7) * N + jit * spread;
+  return Math.trunc(clamp(idx, 3, N));
+}
+
+// cell buffers
+const NC = COLS * ROWS;
+const X = new Float32Array(NC), Y = new Float32Array(NC), JIT = new Float32Array(NC);
+for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+  const i = r * COLS + c; X[i] = (c + 0.5) * CW; Y[i] = (r + 0.5) * CH; JIT[i] = Math.random() * 2 - 1;
+}
+const ci = new Int16Array(NC), R = new Float32Array(NC), G = new Float32Array(NC), B = new Float32Array(NC);
+const LF = new Float32Array(NC);
+
+// Generate a fixed skyline and map its buildings to the character grid.
+const BUILDINGS = [];
+for (let x = 1, id = 0; x < COLS - 4; id++) {
+  const cols = 7 + Math.floor(hash(id + 5, 2) * 5);
+  const rows = 9 + Math.floor(hash(id + 8, 3) * 11);
+  BUILDINGS.push({ id, col: x, cols, rows, center: (x + cols / 2) * CW });
+  x += cols + 1 + Math.floor(hash(id + 2, 7) * 3);
+}
+const BUILDING_AT = new Int16Array(NC).fill(-1);
+const FLOOR_ROW = Math.floor(FLOOR_Y / CH);
+for (let b = 0; b < BUILDINGS.length; b++) {
+  const building = BUILDINGS[b];
+  const firstRow = Math.max(0, FLOOR_ROW - building.rows - 12);
+  for (let row = firstRow; row < FLOOR_ROW; row++) {
+    for (let c = building.col; c < Math.min(COLS, building.col + building.cols); c++) {
+      BUILDING_AT[row * COLS + c] = b;
+    }
+  }
+}
+const SPIRIT_BUILDING = BUILDINGS.reduce((closest, building) =>
+  Math.abs(building.center - W * 0.52) < Math.abs(closest.center - W * 0.52) ? building : closest
+);
+
+function put(i, ch, col, lum) {                    // write shaded colour into cell i
+  ci[i] = ch;
+  const l = clamp(lum), m = 0.22 + 0.85 * l, hot = clamp(clamp(lum - 0.85) * 2);
+  let r = col[0] * m, g = col[1] * m, b = col[2] * m;
+  r += (WHITE[0] - r) * hot; g += (WHITE[1] - g) * hot; b += (WHITE[2] - b) * hot;
+  R[i] = clamp(r); G[i] = clamp(g); B[i] = clamp(b);
+}
+
+// tear-drop flame anchored at (fx, fy) -> [intensity, core] for one cell
+function flameAt(x, y, f, t) {
+  const v = (f.fy - y) / f.fh;
+  if (v > 1 || v < -0.2) return null;
+  const dx = x - (f.fx + f.sway * Math.pow(clamp(v), 2));
+  const half = f.fw / 2;
+  let r;
+  if (v < 0.25) r = Math.hypot(dx / half, (v - 0.25) / 0.4);
+  else r = Math.abs(dx) / Math.max(1e-3, half * Math.pow(clamp(1 - (v - 0.25) / 0.75), 0.9));
+  r += (fbm(x * 0.09 + f.seed, y * 0.09 + t * 7) - 0.5) * 0.55;
+  const inten = clamp(1.15 - r);
+  if (inten <= 0) return null;
+  return [inten, clamp(1 - r * 1.7) * clamp(1 - v * 0.7)];
+}
+
+// ------------------------------------------------------------------ scene
+class Scene {
+  constructor() {
+    this.parts = [];
+    this.sparked = false;
+    this.emberAcc = 0;
+    this.smokeAcc = 0;
+    this.prevTheta = 0;
+    this.spiritProgress = 0;
+    this.spiritBaseY = FLOOR_Y;
+  }
+
+  static angle(t) {
+    const u = clamp((t - T_TIP) / T_FALL);
+    let th = (Math.PI / 2) * u * u;
+    if (t > T_IGNITE) { const tau = t - T_IGNITE; th = Math.PI / 2 - 0.12 * Math.exp(-6 * tau) * Math.abs(Math.sin(tau * 12)); }
+    return th;
+  }
+  static toWorld(lx, ly, th) {
+    const c = Math.cos(th), s = Math.sin(th);
+    return [PX + c * lx - s * ly, PY + s * lx + c * ly];
+  }
+  static matchHead(t) {
+    const keys = [[T_STRIKE, [W * 0.07, H * 0.62]], [T_STRIKE + 0.9, [W * 0.15, H * 0.53]],
+                  [T_LIGHT, [CAND_X - CAND_W * 0.05, FLOOR_Y - CAND_H + 6]], [T_OUT, [W * 0.16, H * 0.58]]];
+    if (t <= keys[0][0]) return keys[0][1];
+    for (let k = 0; k < keys.length - 1; k++) {
+      const [ta, pa] = keys[k], [tb, pb] = keys[k + 1];
+      if (t <= tb) { const e = smoothstep(ta, tb, t); return [pa[0] + (pb[0] - pa[0]) * e, pa[1] + (pb[1] - pa[1]) * e]; }
+    }
+    return keys[keys.length - 1][1];
+  }
+  spawn(x, y, vx, vy, life, kind) { this.parts.push({ x, y, vx, vy, life, max: life, kind }); }
+  updateParticles(t, dt) {
+    this.parts = this.parts.filter(p => {
+      p.life -= dt;
+      if (p.life <= 0) return false;
+      if (p.kind === "spark") p.vy += 420 * dt;
+      else if (p.kind === "smoke") {
+        p.vx += (nz(p.y * 0.01 + t, p.x * 0.01) - 0.5) * 35 * dt;
+        p.vy -= 18 * dt;
+      }
+      else { p.vx += (nz(p.y * 0.02 + t, p.x * 0.01) - 0.5) * 240 * dt; p.vy -= 25 * dt; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      return true;
+    });
+  }
+
+  frame(t, dt) {
+    const lights = [], flames = [];
+
+    // ---- candle state
+    const th = Scene.angle(t);
+    const omega = (th - this.prevTheta) / Math.max(dt, 1e-3);
+    this.prevTheta = th;
+    const lit = smoothstep(T_LIGHT, T_LIGHT + 0.25, t);
+    const grow = smoothstep(T_LIGHT, T_LIGHT + 1.6, t);
+    const fs = lit * (0.35 + 0.65 * grow) * (1 + 0.45 * smoothstep(T_LIGHT + 2, T_TIP, t));
+    const hcur = CAND_H - 14 * clamp((t - T_LIGHT) / (T_TIP - T_LIGHT));
+    const [wx, wy] = Scene.toWorld(-CAND_W / 2, -hcur - 4, th);
+    if (fs > 0) {
+      const flick = 0.85 + 0.3 * nz(t * 6, 1.7);
+      const fh = 105 * fs * flick, fw = 58 * fs * (0.9 + 0.2 * nz(t * 4, 4.2));
+      const sway = (nz(t * 2.5, 9.1) - 0.5) * 22 * fs - omega * 14;
+      flames.push({ fx: wx, fy: wy + 6, fh, fw, sway, seed: 0 });
+      lights.push([wx, wy - fh * 0.35, fs * flick, 170]);
+    }
+
+    // ---- match
+    const mOn = smoothstep(T_STRIKE, T_STRIKE + 0.15, t) * (1 - smoothstep(T_OUT - 0.35, T_OUT, t));
+    const [mx, my] = Scene.matchHead(t);
+    if (t >= T_STRIKE && !this.sparked) {
+      this.sparked = true;
+      for (let k = 0; k < 34; k++) {
+        const a = -Math.PI + Math.random() * (Math.PI + 0.2), sp = 60 + Math.random() * 200;
+        this.spawn(mx, my, Math.cos(a) * sp + 80, Math.sin(a) * sp, 0.25 + Math.random() * 0.45, "spark");
+      }
+    }
+    if (mOn > 0.01) {
+      const flare = 1 + 0.8 * Math.exp(-(t - T_STRIKE) * 6), mf = 0.9 + 0.2 * nz(t * 9, 3.3);
+      flames.push({ fx: mx, fy: my - 2, fh: 62 * flare * mOn * mf, fw: 28 * flare, sway: (nz(t * 3, 5.5) - 0.5) * 8, seed: 11 });
+      lights.push([mx, my - 15, 0.55 * mOn, 110]);
+    }
+
+    // ---- floor fire (per column)
+    const burning = t > T_IGNITE;
+    const colA = new Float32Array(COLS), hcol = new Float32Array(COLS), band = new Float32Array(COLS);
+    const cityBurn = new Float32Array(BUILDINGS.length);
+    let spiritProgress = 0;
+    let spiritBaseY = FLOOR_Y;
+    let maxH = 0;
+    if (burning) {
+      const age = t - T_IGNITE, speed = 230 + 170 * age, reach = 230 * age + 85 * age * age;
+      const layCx = PX + hcur * 0.5;
+      for (let c = 0; c < COLS; c++) {
+        const x = (c + 0.5) * CW;
+        colA[c] = clamp(((reach - Math.abs(x - wx)) / speed) / 0.7);
+        hcol[c] = colA[c] * ((55 + 120 * nz2(x * 0.011 + 3.1, t * 0.35)) * (0.55 + 0.9 * nz2(x * 0.045, t * 2.2))
+                  + 90 * Math.exp(-(((x - layCx) / 110) ** 2)));
+        band[c] = colA[c] * (0.75 + 0.25 * nz2(x * 0.08, t * 3));
+        if (hcol[c] > maxH) maxH = hcol[c];
+      }
+      for (let b = 0; b < BUILDINGS.length; b++) {
+        const building = BUILDINGS[b];
+        const distance = Math.max(0, Math.abs(building.center - wx) - building.cols * CW / 2 - 20);
+        const arrival = (-230 + Math.sqrt(230 * 230 + 340 * distance)) / 170;
+        const timeBurning = age - arrival;
+        cityBurn[b] = smoothstep(0, 1.8, timeBurning);
+        if (cityBurn[b] > 0.01) {
+          const roofY = FLOOR_Y - building.rows * CH;
+          lights.push([building.center, roofY, cityBurn[b] * 0.8, 125]);
+          lights.push([building.center, roofY + building.rows * CH * 0.55, cityBurn[b] * 0.55, 90]);
+        }
+      }
+      const spiritDistance = Math.max(0, Math.abs(SPIRIT_BUILDING.center - wx) - SPIRIT_BUILDING.cols * CW / 2 - 20);
+      const spiritArrival = (-230 + Math.sqrt(230 * 230 + 340 * spiritDistance)) / 170;
+      const spiritStart = T_IGNITE + spiritArrival + 0.8;
+      spiritProgress = clamp((t - spiritStart) / 3);
+      spiritBaseY = FLOOR_Y - spiritProgress * 250;
+      if (spiritProgress > 0) lights.push([SPIRIT_BUILDING.center, spiritBaseY - 48, 1.1, 105]);
+      const lo = Math.max(0, wx - reach), hi = Math.min(W, wx + reach);
+      if (hi > lo) for (let k = 0; k < 10; k++) {
+        const lx = lo + (hi - lo) * (k + 0.5) / 10, c = Math.trunc(clamp(lx / CW, 0, COLS - 1));
+        lights.push([lx, FLOOR_Y - hcol[c] * 0.45, 0.75 * colA[c], 210]);
+      }
+    }
+    this.spiritProgress = spiritProgress;
+    this.spiritBaseY = spiritBaseY;
+
+    // ---- per-cell pass
+    const cosT = Math.cos(th), sinT = Math.sin(th);
+    const gm = lit * (0.8 + 0.2 * nz(t * 8, 2.2));
+    const burnt = clamp((t - T_IGNITE) / 5) * 0.8;
+    const floorRow = Math.floor(FLOOR_Y / CH);
+    const gains = [1.15, 0.85, 0.5, 0.28];
+    const col = [0, 0, 0];
+
+    for (let i = 0; i < NC; i++) {
+      const x = X[i], y = Y[i], c = i % COLS, row = (i / COLS) | 0;
+
+      // light field
+      let lf = 0;
+      for (const [lx, ly, s, r] of lights) {
+        const d = Math.hypot(x - lx, y - ly);
+        lf += s * (Math.exp(-((d / r) ** 2)) + 0.12 * Math.exp(-d / (1.5 * r)));
+      }
+      LF[i] = lf;
+
+      // 1. background
+      const bl = lf * 0.06;
+      if (bl < 0.022) { ci[i] = 0; R[i] = G[i] = B[i] = 0; }
+      else put(i, Math.trunc(clamp(bl / 0.12 * 7 + JIT[i] * 1.5, 1, 8)), BG_COL, bl * 2.5);
+
+      // 2. city skyline; buildings ignite as the ground fire reaches them.
+      const buildingIndex = BUILDING_AT[i];
+      if (buildingIndex >= 0) {
+        const building = BUILDINGS[buildingIndex];
+        const localRow = row - (FLOOR_ROW - building.rows);
+        const localCol = c - building.col;
+        const fire = cityBurn[buildingIndex];
+        const window = localRow > 0 && localRow < building.rows - 1
+          && (localRow % 3 === 1) && ((localCol + buildingIndex) % 3 === 1);
+        const roof = localRow === 0;
+        const aboveRoof = localRow < 0;
+
+        if (aboveRoof && fire > 0.01) {
+          const rise = -localRow * CH;
+          const flicker = 0.72 + 0.28 * nz(t * 8 + buildingIndex, 2.3);
+          const flameHeight = 32 + 62 * fire * flicker;
+          const taper = Math.max(0.12, 1 - rise / flameHeight);
+          const dx = Math.abs(X[i] - building.center);
+          const width = building.cols * CW * 0.58 * Math.pow(taper, 0.75);
+          const turbulence = (fbm(X[i] * 0.09 + buildingIndex, Y[i] * 0.09 + t * 6) - 0.5) * 0.6;
+          const intensity = clamp(1.12 - dx / Math.max(1, width) + turbulence);
+          if (intensity > 0.08 && rise < flameHeight) {
+            const core = clamp(1 - dx / Math.max(1, width * 0.38)) * clamp(1 - rise / flameHeight);
+            for (let j = 0; j < 3; j++) {
+              col[j] = EMBER[j] + (ORANGE[j] - EMBER[j]) * clamp(intensity * 1.3);
+              col[j] += (WHITE[j] - col[j]) * core;
+            }
+            put(i, rampIndex(intensity, JIT[i], 2.5), col, 0.4 + intensity);
+          }
+        } else {
+          const charred = fire * 0.72;
+          if (window && fire > 0.1) {
+            const flare = fire * (0.65 + 0.35 * nz(t * 5 + localCol, localRow));
+            for (let j = 0; j < 3; j++) col[j] = WINDOW_COL[j] + (ORANGE[j] - WINDOW_COL[j]) * flare;
+            put(i, CI[flare > 0.75 ? "*" : flare > 0.4 ? "+" : "."], col, 0.32 + flare * 0.65);
+          } else if (roof || localCol === 0 || localCol === building.cols - 1 || (localRow + localCol) % 4 === 0) {
+            for (let j = 0; j < 3; j++) col[j] = CITY_COL[j] + (BURNT[j] - CITY_COL[j]) * charred;
+            put(i, CI[roof ? "#" : localCol === 0 ? "[" : localCol === building.cols - 1 ? "]" : "|"], col, 0.28 + fire * 0.35);
+          } else {
+            ci[i] = 0;
+          }
+        }
+      }
+
+      // 3. floor
+      if (y >= FLOOR_Y) {
+        const fr = Math.floor((y - FLOOR_Y) / CH);
+        const pat = fr === 0 ? (c % 3 === 0 ? CI["+"] : CI["="])
+                  : ((c + fr * 2) % 6 === 0 ? CI["+"] : ((c + fr) % 2 === 0 ? CI["-"] : 0));
+        let fl = lf * 0.6 * Math.exp(-fr * 0.22);
+        if (fr === 0) fl *= 1.3;
+        if (fl > 0.04 && pat > 0) put(i, pat, FLOOR_COL, fl); else ci[i] = 0;
+      }
+
+      // 4. candle body
+      const dx = x - PX, dy = y - PY;
+      const lx = cosT * dx + sinT * dy, ly = -sinT * dx + cosT * dy;
+      if (lx >= -CAND_W && lx <= 0 && ly >= -hcur && ly <= 0) {
+        const across = Math.abs((lx + CAND_W / 2) / (CAND_W / 2));
+        const glow = gm * Math.exp(-(hcur + ly) / 36);
+        const k = (0.05 + glow * 1.25 + lf * 0.55) * (1 - 0.45 * across) * (1 - 0.45 * burnt);
+        const g = clamp(glow);
+        for (let j = 0; j < 3; j++) { col[j] = WAX[j] + (ORANGE[j] - WAX[j]) * g; col[j] += (BURNT[j] - col[j]) * burnt; }
+        put(i, rampIndex(k, JIT[i], 1.5), col, k);
+      }
+
+      // 5. white-hot band along the burning floor
+      if (burning && row >= floorRow && row < floorRow + 4) {
+        const glow = band[c] * gains[row - floorRow];
+        if (glow > 0.12) {
+          const ch = row === floorRow ? (glow > 0.3 ? CI["@"] : CI["0"]) : rampIndex(glow, JIT[i], 3);
+          const g = clamp(glow);
+          for (let j = 0; j < 3; j++) col[j] = EMBER[j] + (ORANGE[j] - EMBER[j]) * g;
+          put(i, ch, col, glow * 1.1);
+        }
+      }
+
+      // 6. flames (candle, match, floor fire)
+      let best = null;
+      for (const f of flames) {
+        const res = flameAt(x, y, f, t);
+        if (res && (!best || res[0] > best[0])) best = res;
+      }
+      if (burning && hcol[c] > 1) {
+        const d = FLOOR_Y - y;
+        if (d > -CH * 0.5 && d < maxH * 1.5 + 20) {
+          let n = fbm(x * 0.05, y * 0.07 + t * 4.5);
+          n = clamp((n - 0.5) * 2.4 + 0.5);
+          const fire = clamp(1.05 - d / (hcol[c] * (0.35 + 1.1 * n) + 1e-3));
+          if (fire > 0) {
+            const core = clamp(fire * 1.6 - 0.7) * clamp(1 - d / 60);
+            if (!best || fire > best[0]) best = [fire, core];
+          }
+        }
+      }
+      if (best) {
+        const [inten, core] = best;
+        const fl = inten * 0.8 + core * 0.35;
+        if (fl > 0.06 && fl >= 0.6 * clamp(Math.max(R[i], G[i], B[i]) - 0.25)) {
+          const a = clamp(inten * 1.4 - 0.1), cc = clamp(core);
+          for (let j = 0; j < 3; j++) { col[j] = EMBER[j] + (ORANGE[j] - EMBER[j]) * a; col[j] += (WHITE[j] - col[j]) * cc; }
+          const djit = (nz2(x * 0.9, y * 0.9 + t * 9) - 0.5) * 2.2;
+          put(i, rampIndex(fl, djit, 3), col, 0.35 + fl);
+        }
+      }
+
+    }
+
+    // dark wick while unlit
+    if (lit < 0.5 && th < 0.3) {
+      const r = Math.floor(wy / CH), c = Math.floor(wx / CW);
+      if (r >= 0 && r < ROWS && c >= 0 && c < COLS) { const i = r * COLS + c; ci[i] = CI["|"]; R[i] = 0.30; G[i] = 0.24; B[i] = 0.20; }
+    }
+
+    // ---- particles
+    if (burning) {
+      let mean = 0; for (let c = 0; c < COLS; c++) mean += colA[c]; mean /= COLS;
+      this.emberAcc += dt * 55 * (mean * 2 + 0.2);
+      while (this.emberAcc > 1) {
+        this.emberAcc -= 1;
+        const c = Math.floor(Math.random() * COLS);
+        if (colA[c] > 0.3) this.spawn((c + 0.5) * CW, FLOOR_Y - (20 + Math.random() * 120),
+                                      Math.random() * 40 - 20, -(60 + Math.random() * 90), 1 + Math.random() * 2.2, "ember");
+      }
+      const activeBuildings = BUILDINGS.filter((_, b) => cityBurn[b] > 0.15);
+      if (activeBuildings.length) {
+        this.smokeAcc += dt * activeBuildings.length * 1.4;
+        while (this.smokeAcc >= 1) {
+          this.smokeAcc -= 1;
+          const building = activeBuildings[Math.floor(Math.random() * activeBuildings.length)];
+          this.spawn(building.center + (Math.random() - 0.5) * building.cols * CW * 0.5,
+                     FLOOR_Y - building.rows * CH,
+                     Math.random() * 24 - 12, -(28 + Math.random() * 28),
+                     2.2 + Math.random() * 2.4, "smoke");
+        }
+      }
+    }
+    this.updateParticles(t, dt);
+    for (const p of this.parts) {
+      const r = Math.floor(p.y / CH), c = Math.floor(p.x / CW);
+      if (r < 0 || r >= ROWS || c < 0 || c >= COLS) continue;
+      const k = p.life / p.max, i = r * COLS + c, m = 0.45 + 0.55 * k;
+      if (p.kind === "smoke") {
+        ci[i] = CI[k > 0.65 ? "." : k > 0.3 ? ":" : "~"];
+        R[i] = 0.22 * m; G[i] = 0.20 * m; B[i] = 0.19 * m;
+        continue;
+      }
+      ci[i] = CI[k > 0.6 ? "*" : k > 0.3 ? "+" : "."];
+      R[i] = (ORANGE[0] + (WHITE[0] - ORANGE[0]) * k) * m;
+      G[i] = (ORANGE[1] + (WHITE[1] - ORANGE[1]) * k) * m;
+      B[i] = (ORANGE[2] + (WHITE[2] - ORANGE[2]) * k) * m;
+    }
+  }
+}
+
+// ------------------------------------------------------------- rendering
+const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+const FONT = 'bold 11px Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Liberation Mono", monospace';
+let scale = 1;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = Math.floor(W * scale) + "px";
+  canvas.style.height = Math.floor(H * scale) + "px";
+  canvas.width = Math.floor(W * scale * dpr);
+  canvas.height = Math.floor(H * scale * dpr);
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const hex = v => { const q = Math.round(clamp(v) * 31) * 255 / 31 | 0; return (q < 16 ? "0" : "") + q.toString(16); };
+function drawSpirit() {
+  if (scene.spiritProgress <= 0) return;
+
+  ctx.save();
+  ctx.globalAlpha = clamp(scene.spiritProgress * 4);
+  ctx.translate(SPIRIT_BUILDING.center, scene.spiritBaseY + Math.sin(t * 5) * 2);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const fireGlow = ctx.createLinearGradient(-70, -190, 65, -35);
+  fireGlow.addColorStop(0, "#ff7424");
+  fireGlow.addColorStop(0.48, "#ffd58a");
+  fireGlow.addColorStop(1, "#25cfff");
+
+  const stroke = (path, width, color, blur = 0) => {
+    ctx.beginPath();
+    path();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = blur;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  };
+  const armBack = () => {
+    ctx.moveTo(-13, -132);
+    ctx.bezierCurveTo(-34, -133, -39, -150, -54, -171);
+    ctx.lineTo(-67, -183);
+  };
+  const armRaised = () => {
+    ctx.moveTo(15, -133);
+    ctx.bezierCurveTo(35, -143, 40, -162, 48, -181);
+    ctx.lineTo(54, -190);
+  };
+  const rearLeg = () => {
+    ctx.moveTo(-2, -82);
+    ctx.bezierCurveTo(-16, -70, -30, -55, -41, -36);
+    ctx.lineTo(-58, -29);
+  };
+  const leadLeg = () => {
+    ctx.moveTo(8, -82);
+    ctx.bezierCurveTo(27, -70, 38, -59, 49, -53);
+    ctx.lineTo(65, -56);
+  };
+
+  ctx.globalCompositeOperation = "lighter";
+  stroke(armBack, 30, "#ff762d", 24);
+  stroke(armRaised, 26, "#28d8ff", 24);
+  stroke(rearLeg, 30, "#ff7b32", 22);
+  stroke(leadLeg, 30, "#30dfff", 24);
+  ctx.globalCompositeOperation = "source-over";
+
+  for (const [path, width] of [[rearLeg, 20], [leadLeg, 20], [armBack, 16], [armRaised, 16]]) {
+    stroke(path, width + 9, "#17131c");
+    stroke(path, width + 3, fireGlow, 12);
+    stroke(path, width, fireGlow, 8);
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(-15, -139);
+  ctx.bezierCurveTo(-7, -153, 12, -154, 24, -140);
+  ctx.lineTo(20, -111);
+  ctx.bezierCurveTo(18, -96, 13, -84, 8, -77);
+  ctx.lineTo(-7, -79);
+  ctx.bezierCurveTo(-15, -96, -20, -119, -15, -139);
+  ctx.closePath();
+  ctx.fillStyle = fireGlow;
+  ctx.shadowColor = "#ff9b45";
+  ctx.shadowBlur = 22;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "#211720";
+  ctx.lineWidth = 5;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(-9, -164);
+  ctx.bezierCurveTo(-19, -181, -7, -201, 10, -200);
+  ctx.bezierCurveTo(23, -199, 29, -190, 27, -179);
+  ctx.lineTo(37, -172);
+  ctx.lineTo(27, -167);
+  ctx.lineTo(24, -158);
+  ctx.bezierCurveTo(14, -151, -1, -154, -9, -164);
+  ctx.closePath();
+  const faceGradient = ctx.createLinearGradient(-8, -190, 32, -165);
+  faceGradient.addColorStop(0, "#ffb25e");
+  faceGradient.addColorStop(0.6, "#ffe7bd");
+  faceGradient.addColorStop(1, "#55dcff");
+  ctx.fillStyle = faceGradient;
+  ctx.shadowColor = "#54ddff";
+  ctx.shadowBlur = 20;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "#281720";
+  ctx.lineWidth = 4;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(-11, -178);
+  ctx.lineTo(-23, -187);
+  ctx.lineTo(-10, -186);
+  ctx.lineTo(-15, -201);
+  ctx.lineTo(-2, -191);
+  ctx.lineTo(4, -208);
+  ctx.lineTo(9, -194);
+  ctx.lineTo(22, -202);
+  ctx.lineTo(17, -187);
+  ctx.lineTo(7, -181);
+  ctx.closePath();
+  const hairGradient = ctx.createLinearGradient(-20, -201, 22, -183);
+  hairGradient.addColorStop(0, "#ff6b28");
+  hairGradient.addColorStop(0.55, "#ffc15e");
+  hairGradient.addColorStop(1, "#33d9ff");
+  ctx.fillStyle = hairGradient;
+  ctx.shadowColor = "#ff9b3d";
+  ctx.shadowBlur = 18;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  stroke(() => {
+    ctx.moveTo(20, -181);
+    ctx.lineTo(24, -182);
+  }, 3, "#43e5ff", 8);
+  stroke(() => {
+    ctx.moveTo(27, -179);
+    ctx.lineTo(34, -173);
+    ctx.lineTo(28, -170);
+  }, 2.5, "#9c401f");
+  stroke(() => {
+    ctx.moveTo(-5, -167);
+    ctx.quadraticCurveTo(3, -160, 12, -164);
+  }, 2, "#9c401f");
+  stroke(() => {
+    ctx.moveTo(-8, -132);
+    ctx.quadraticCurveTo(-1, -138, 5, -130);
+    ctx.moveTo(5, -130);
+    ctx.quadraticCurveTo(12, -137, 18, -132);
+    ctx.moveTo(-2, -119);
+    ctx.quadraticCurveTo(4, -116, 10, -119);
+    ctx.moveTo(-1, -108);
+    ctx.quadraticCurveTo(4, -105, 9, -108);
+  }, 2, "#9a492c");
+  stroke(() => {
+    ctx.moveTo(45, -183);
+    ctx.lineTo(39, -198);
+    ctx.moveTo(50, -187);
+    ctx.lineTo(52, -204);
+    ctx.moveTo(55, -185);
+    ctx.lineTo(63, -198);
+  }, 4, "#43ddff", 12);
+  stroke(() => {
+    ctx.moveTo(-61, -179);
+    ctx.lineTo(-71, -188);
+  }, 8, "#ff9c48", 12);
+  stroke(() => {
+    ctx.moveTo(-58, -29);
+    ctx.lineTo(-43, -36);
+    ctx.lineTo(-37, -31);
+    ctx.moveTo(49, -53);
+    ctx.lineTo(63, -59);
+    ctx.lineTo(69, -54);
+  }, 4, "#fff0ce", 7);
+
+  ctx.restore();
+}
+
+function draw() {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  ctx.font = FONT;
+  ctx.textBaseline = "top";
+  let last = "";
+  for (let i = 0; i < NC; i++) {
+    if (!ci[i]) continue;
+    const fill = "#" + hex(R[i]) + hex(G[i]) + hex(B[i]);
+    if (fill !== last) { ctx.fillStyle = fill; last = fill; }
+    ctx.fillText(ALL[ci[i]], (i % COLS) * CW, ((i / COLS) | 0) * CH);
+  }
+  drawSpirit();
+}
+
+// --------------------------------------------------------------- main loop
+let scene = new Scene(), t = 0, paused = false, prev = performance.now();
+function restart() { scene = new Scene(); t = 0; prev = performance.now(); }
+function loop(now) {
+  const dt = Math.min(0.1, (now - prev) / 1000);
+  prev = now;
+  if (!paused) { t += dt; scene.frame(t, dt); draw(); }
+  requestAnimationFrame(loop);
+}
+window.addEventListener("keydown", e => {
+  if (e.key === "r" || e.key === "R") restart();
+  else if (e.key === " ") { paused = !paused; prev = performance.now(); e.preventDefault(); }
+});
+canvas.addEventListener("click", restart);
+setTimeout(() => { document.getElementById("hint").style.opacity = 0; }, 6000);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
